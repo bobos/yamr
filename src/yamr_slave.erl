@@ -16,36 +16,36 @@
 -include("yamr.hrl").
 
 start() ->
-    gen_server:start_link({local, ?SLAVE}, ?MODULE, [], []).
+    {ClusterName, SlaveName, _N, _Server} = split_slavename(node()),
+    gen_server:start_link({local, SlaveName}, ?MODULE, 
+                          [#state{clustername=ClusterName}], []).
 
 %%%---------------------------------------------------------------------------
 %%% gen_server callbacks
 %%%---------------------------------------------------------------------------
-init([]) ->
+init([State]) ->
     {ok,[[Master]]} = init:get_argument(yamrmaster),
     MasterName = list_to_atom(Master),
-    {?MASTER, MasterName} ! {slave_up, node()},
+    try ok = gen_server:call({?MASTER, MasterName}, {slave_up, node()})
+    catch Err:Reason -> ?LOG("slave failed ~p:~p", [Err, Reason]), halt() end,
     ?LOG("slave is up"),
-    {ClusterName, _N, _Server} = split_slavename(node()),
-    State = #state{clustername = ClusterName,
-                   mastername = MasterName},
-    {ok, start_heartbeat_daemon(State)}.
+    {ok, start_heartbeat_daemon(State#state{mastername = MasterName})}.
 
 handle_call(_Msg, _From, State) ->
     {noreply, State}.
+
+handle_cast({stop, ?MASTER}, _State) ->
+    ?LOG("stop slave"),
+    halt();
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({'DOWN', _MonitorRef, process, Pid, Info}, State) ->
     if Pid == State#state.heartbeat_daemon ->
-            ?LOG("Hearbeat daemon is screwed:~p, restart it\n", [Info]),
+            ?LOG("hearbeat daemon is screwed:~p, restart it\n", [Info]),
             {noreply, start_heartbeat_daemon(State)};
        true -> {noreply, State} end;
-
-handle_info({stop, ?MASTER}, _State) ->
-    ?LOG("stop slave"),
-    halt();
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -64,10 +64,8 @@ start_heartbeat_daemon(State) when is_record(State, state) ->
 start_heartbeat_daemon(ClusterName, Master) when is_list(ClusterName) ->
     %% send heartbeat to master every 20s
     timer:sleep(20*1000),
-    {?MASTER, Master} ! {heart_beat, ClusterName, node(), self()},
-    receive ack -> ok
-    after 10*1000 ->
-        ?LOG("Master unreachable, self-terminate"), 
-        halt()
-    end,
+    try ack = gen_server:call({?MASTER, Master},
+                              {heart_beat, ClusterName, node()}, 10*1000)
+    catch Err:Reason -> ?LOG("master unreachable due to ~p:~p, "
+                             "self-terminating", [Err, Reason]), halt() end,
     start_heartbeat_daemon(ClusterName, Master).

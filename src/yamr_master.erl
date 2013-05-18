@@ -38,32 +38,29 @@ handle_call({remove_server, {ClusterName, ServerName, NoOfSlaves}},
     remove_slaves(ClusterName, ServerName, list_to_integer(NoOfSlaves)),
     {reply, "OK", State};
 
+handle_call({slave_up, Node}, _From, State) ->
+    ?LOG("slave ~p up", [Node]),
+    monitor_node(Node, true),
+    add_slave(Node),
+    {reply, ok, State};
+       
+%% heartbeat from slaves
+handle_call({heart_beat, ClusterName, Node}, _From, State) ->
+    case get_cluster(ClusterName) of
+        not_found -> {noreply, State};
+        Cluster -> case [S||S<-Cluster#cluster.slaves, S#slave.name == Node] of
+                       [] -> {noreply, State}; _ -> {reply, ack, State} end
+    end;
+
 handle_call(_Msg, _From, State) ->
     {noreply, State}.
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({slave_up, Node}, State) ->
-    ?LOG("slave ~p up", [Node]),
-    monitor_node(Node, true),
-    add_slave(Node),
-    {noreply, State};
-       
-%% heartbeat from slaves
-handle_info({heart_beat, ClusterName, Node, From}, State) ->
-    case get_cluster(ClusterName) of
-        not_found -> ok;
-        Cluster ->
-            case [S||S<-Cluster#cluster.slaves, S#slave.name == Node] of
-                [] -> ok;
-                _ -> From ! ack
-            end
-    end,
-    {noreply, State};
 
 handle_info({nodedown, Node}, State) ->
-    ?LOG("Slave down:~p", [Node]),
+    ?LOG("slave down:~p", [Node]),
     restart_slave_if_needed(Node),
     {noreply, State};
 
@@ -122,13 +119,13 @@ start_one_slave(ClusterName, Server) ->
 start_one_slave(ClusterName, Server, Args) ->
     case get_a_slavename(ClusterName, Server) of
         {ok, Slave} ->
-            ?LOG("Start slave ~p on ~s with command ~p", 
+            ?LOG("start slave ~p on ~s with command ~p", 
                  [Slave, Server, Args]),
             case slave:start(Server, Slave, Args) of
                 {ok, Node} ->
                     {ok, Node};
                 Reason ->
-                    ?LOG("Failed to start slave:~p", [Reason]),
+                    ?LOG("failed to start slave:~p", [Reason]),
                     {error, Slave, failed_to_start_slave}
             end;
         Error ->
@@ -142,7 +139,7 @@ get_a_slavename(ClusterName, Server) ->
         Cluster ->
             Quota = Cluster#cluster.quota,
             List = [list_to_integer(No)||S<-Cluster#cluster.slaves, 
-                    begin {_,No,_} = split_slavename(S#slave.name),
+                    begin {_,_,No,_} = split_slavename(S#slave.name),
                           S#slave.server == Server end],
             if Quota =< length(List) ->
                   {error, quota_reached};
@@ -154,7 +151,7 @@ get_a_slavename(ClusterName, Server) ->
     end.
 
 add_slave(NodeName) ->
-    {ClusterName, _No, Server} = split_slavename(NodeName),
+    {ClusterName, _, _No, Server} = split_slavename(NodeName),
     case get_cluster(ClusterName) of
         not_found ->
             ?LOG("WARNING!! Not possible to get here, cluster:~p", 
@@ -196,10 +193,11 @@ remove_slaves(ClusterName, Server, NoOfSlaves) ->
     end.
 
 stop_slave(SlaveName) ->
-    {?SLAVE, SlaveName} ! {stop, ?MASTER}.
+    {_, ProcessName, _, _} = split_slavename(SlaveName),
+    gen_server:cast({ProcessName, SlaveName}, {stop, ?MASTER}).
 
 restart_slave_if_needed(Node) ->
-    {ClusterName, _No, Server} = split_slavename(Node),
+    {ClusterName, _, _No, Server} = split_slavename(Node),
     NoRestart =
     case get_cluster(ClusterName) of
         not_found ->
@@ -253,8 +251,8 @@ get_slavename(ClusterName, SlaveNo) when is_integer(SlaveNo) ->
                                integer_to_list(SlaveNo), "_", ClusterName])).
 
 split_slavename(Node) when is_atom(Node) ->
-    [SlavePrefix, Server] = string:tokens(atom_to_list(Node), "@"),
-    [Slave, No|_] = string:tokens(SlavePrefix, "_"),
-    ClusterName = SlavePrefix -- lists:append([Slave, "_", No, "_"]),
-    {ClusterName, list_to_integer(No), Server}.
+    [ProcessName, Server] = string:tokens(atom_to_list(Node), "@"),
+    [Slave, No|_] = string:tokens(ProcessName, "_"),
+    ClusterName = ProcessName -- lists:append([Slave, "_", No, "_"]),
+    {ClusterName, list_to_atom(ProcessName), list_to_integer(No), Server}.
 

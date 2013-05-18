@@ -39,7 +39,12 @@ def add_servers(name):
 
 @app.route('/cluster/<name>/remove', methods=['PUT'])
 def remove_servers(name):
-    return 'NOT READY', 406
+    jsonResp = {}
+    for server, number in ((request.json)['servers']).items():
+        ret = send2erl(form_msg('remove_server', [name, server, number],
+                                request.json))
+        jsonResp[server] = ret
+    return json.dumps(jsonResp, indent=4)
 
 @app.route('/job', methods=['POST'])
 def submit_job():
