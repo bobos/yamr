@@ -24,7 +24,7 @@ start_link() ->
 %% ===================================================================
 
 init([]) ->
-    {ok, { {one_for_one, 5, 10}, [?CHILD(master, worker),
-                                  ?CHILD(tcp_maemon, worker),
-                                  ?CHILD(db_daemon, worker)]} }.
+    {ok, { {one_for_one, 5, 10}, [?CHILD(yamr_master, worker),
+                                  ?CHILD(tcp_daemon, worker)]}}.
+                                  %?CHILD(db_daemon, worker)]} }.
 
