@@ -65,9 +65,9 @@ do_recv(Sock) ->
             [Hdr, Timeout|Body] = string:tokens(Msg, "\x1e"),
             Reply = 
             try gen_server:call(?MASTER, 
-                                {list_to_atom(Hdr), list_to_tuple(Body)},
+                                {list_to_atom(Hdr), Body},
                                 list_to_integer(Timeout)*1000)
-            catch _Err:_Reason -> "master unreachable" end,
+            catch _Err:_Reason -> "Timeout" end,
             gen_tcp:send(Sock, Reply);
         _ ->
             ok

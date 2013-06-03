@@ -52,9 +52,13 @@ def submit_job():
     callbackModule = (request.json)['callback module']
     language = (request.json)['language']
     codePath = (request.json)['code path']
+    vsn = (request.json)['version number']
+    prio = (request.json)['priority']
+    partition = (request.json)['partition']
     jobFile = (request.json)['job file']
     return send2erl(form_msg('submit_job', [cluster, callbackModule, 
-                             language, codePath, jobFile], request.json))
+                             language, codePath, vsn, prio, partition, 
+                             jobFile], request.json))
 
 def send2erl(message):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
