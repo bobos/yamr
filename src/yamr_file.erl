@@ -85,35 +85,26 @@ read(Job, Idx) ->
 
 result(Job, Idx, KVs) ->
     FileName = get_prefix(Job, Idx) ++ atom_to_list(node()) ++ ".result",
-    {ok, Fd} = file:open(FileName, write),
-    lists:foreach(fun({K, V}) -> io:format(Fd, "~p:~p~n", [K, V]) end, KVs),
-    ok = file:close(Fd).
+    file:write_file(FileName, term_to_binary(KVs)).
 
 get_result(Job) ->
-    Prefix = lists:append([?TMP, Job#job.clustername, "_", Job#job.name, "_"]),
-    %% remove all tmp files
-    lists:foreach(fun(F) -> file:delete(F) end, 
-                  filelib:wildcard(Prefix++"*.tmp")),
-    %% merge result files
-    %ResultFiles = filelib:wildcard(Prefix++"*.result"),
-    MegRes = lists:append([?TMP,Job#job.clustername,"_",Job#job.name,".all"]),
-    %lists:foreach(fun(F) -> 
-    %                {ok, Bin} = file:read_file(F),
-    %                file:delete(F),
-    %                file:write_file(MegRes, Bin, [append])
-    %              end, ResultFiles),
-    MegRes.
+    lists:append([?TMP, Job#job.clustername, "_", Job#job.name, "_*.result"]).
 
 write2file(Job, Tab) ->
-    Idx = get_index(Tab),
-    FileName = get_filename(Job, Idx),
-    Lock = get_lock(FileName),
-    ets:tab2file(Tab, FileName),
-    ets:delete_all_objects(Tab),
-    ets:insert(Tab, {index, Idx}),
-    ets:insert(Tab, {size, 0}),
-    remove_lock(Lock).
-
+    case ets:info(Tab) of
+        undefined ->
+            ok;
+        _ ->
+            Idx = get_index(Tab),
+            FileName = get_filename(Job, Idx),
+            Lock = get_lock(FileName),
+            ets:tab2file(Tab, FileName),
+            ets:delete_all_objects(Tab),
+            ets:insert(Tab, {index, Idx}),
+            ets:insert(Tab, {size, 0}),
+            remove_lock(Lock)
+    end.
+        
 read_file([], Acc) ->
     Acc;
 read_file([File|Rest], Acc) ->

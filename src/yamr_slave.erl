@@ -9,14 +9,15 @@
 
 -import(yamr_master, [split_slavename/1]).
 
--record(state, {heartbeat_daemon::{pid(), reference()},
+-include("yamr.hrl").
+-record(state, {state=?idle::?idle|?map|?reduce,
+                heartbeat_daemon::{pid(), reference()},
                 map_worker::{pid(), reference()},
                 reduce_worker::{pid(), reference()},
                 jobname=[]::string(),
                 clustername::string(),
                 mastername::node()}).
 
--include("yamr.hrl").
 -define(TMP_DB, tmp_db).
 
 start() ->
@@ -45,10 +46,10 @@ init([State]) ->
     ?LOG("slave is up"),
     {ok, start_heartbeat_daemon(State#state{mastername = MasterName})}.
 
-handle_call({prepare_reduce, Job}, _From, State) 
+handle_call({dump_remain_map_data, Job}, _From, State) 
             when State#state.jobname == Job#job.name ->
-    ?LOG("reduce preparation phase for ~p", [Job#job.name]),
-    ok = prepare_reduce(Job),
+    ?LOG("dump all map data from tabs for ~p", [Job#job.name]),
+    dump_remain_map_data(Job),
     {reply, ack, State};
 
 handle_call({map_report, ReduceIdxs, JobName}, _From, State) ->
@@ -73,8 +74,11 @@ handle_call({reduce_report, ReduceIdx, JobName}, _From, State) ->
 handle_call(_Msg, _From, State) ->
     {noreply, State}.
 
-handle_cast({stop, ?MASTER}, _State) ->
-    ?LOG("stop slave"),
+handle_cast({stop, Reason, ?MASTER}, State) ->
+    ?LOG("stop slave reason:~p", [Reason]),
+    if Reason =:= normal ->
+        cast_master(normal_stop, State#state.mastername);
+       true -> ok end,
     halt();
 
 handle_cast({map, Job, Task}, State) ->
@@ -146,33 +150,44 @@ handle_map_task(Job, Task, State) when Job#job.language =:= "Erlang" ->
     if State#state.jobname =:= Job#job.name ->
         State;
        true -> 
-        prepare_env(Job),
+        prepare_env(Job, ?map),
         State#state{jobname=Job#job.name}
     end,
     Parent = self(),
     Fun = fun() -> map(Job, Task, Parent) end,
-    NewState#state{map_worker = start_a_worker(Fun)}.
+    NewState#state{state = ?map, map_worker = start_a_worker(Fun)}.
 
 handle_reduce_task(Job, Task, State) when Job#job.language =:= "Erlang" ->
-    NewState=
-    if State#state.jobname =:= Job#job.name ->
-        State;
-       true -> 
-        prepare_env(Job),
-        ?LOG("env preparation done"),
-        State#state{jobname=Job#job.name}
-    end,
-    Parent = self(),
-    Fun = fun() -> reduce(Job, Task, Parent, Job#job.phase == reduce) end,
-    NewState#state{reduce_worker = start_a_worker(Fun)}.
+    case {State#state.jobname, State#state.state} of
+        {_, ?map} ->
+            dump_remain_map_data(Job),
+            State;
+        {JobName, SlaveStat}->
+            NewState =
+            if JobName == Job#job.name andalso SlaveStat == ?reduce ->
+                State;
+               true ->
+                prepare_env(Job, ?reduce),
+                State#state{jobname = Job#job.name, state = ?reduce}
+            end,
+            Parent = self(),
+            Fun = fun() -> reduce(Job, Task, Parent, 
+                           Job#job.phase == reduce) end,
+            NewState#state{reduce_worker = start_a_worker(Fun)}
+    end.
 
-prepare_reduce(Job) ->
+dump_remain_map_data(Job) ->
+    ?LOG("dump all remaining map data for ~p", [Job#job.name]),
     Pid = self(),
-    Child = spawn(fun() -> yamr_file:dump_tabs(Job), Pid ! all_dumped end),
+    spawn(fun() -> yamr_file:dump_tabs(Job), Pid ! all_dumped end),
     receive
-        all_dumped -> yamr_file:delete_tabs(), ok
+        all_dumped -> yamr_file:delete_tabs()
     after 60000 -> 
-        exit(Child, kill), ?LOG("dump timeout for ~p", [Job#job.name]), nok end.
+        ?LOG("dump timeout for ~p", [Job#job.name]), 
+        halt() 
+    end,
+    %% restart slave to cleanup everything left during map operation
+    gen_server:cast(self(), {stop, normal, ?MASTER}).
 
 map(Job, Task, Pid) ->
     CBModule = list_to_atom(Job#job.cb_module),
@@ -200,12 +215,11 @@ loop(Job, Idx, CB, Pid, Fun) ->
     receive 
         map_done ->
             Fun()
+    after 100 -> ok
     end,
     retreive_map_data(Job, Idx),
-    timer:sleep(100),
     loop(Job, Idx, CB, Pid, Fun).
 
-%start_reduce(Job, Idx, CB) ->
 retreive_map_data(Job, Idx) ->
     KVs = yamr_file:read(Job, Idx),
     %lists:foldl(
@@ -215,9 +229,10 @@ retreive_map_data(Job, Idx) ->
     %    end, [], aggre_values(yamr_file:read(Job, Idx), lists)),
     write_db(KVs).
 
-prepare_env(Job) ->
-    yamr_file:init(Job),
-    true = code:add_pathz(Job#job.code_path).
+prepare_env(Job, Phase) ->
+    if Phase =:= ?map -> yamr_file:init(Job); true -> ok end,
+    true = code:add_pathz(Job#job.code_path),
+    ?LOG("~p environment for ~p is ready", [Phase, Job#job.name]).
 
 pre_reduce(_, [], _, Acc) ->
     Acc;

@@ -8,7 +8,7 @@
          terminate/2, code_change/3]).
 
 -export([split_slavename/1]).
--record(state, {}).
+-record(state, {normal_stop_slaves=sets:new()}).
 -include("yamr.hrl").
 
 -define(CLUSTER_TAB, yamr_cluster_tab).
@@ -102,14 +102,22 @@ handle_cast({slave_idle, Node}, State) ->
     find_a_task4slave(Node),
     {noreply, State};
 
+handle_cast({normal_stop, Node}, State) ->
+    {noreply, 
+     State#state{normal_stop_slaves=
+                 sets:add_element(Node, State#state.normal_stop_slaves)}};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({nodedown, Node}, State) ->
     ?LOG("slave down:~p", [Node]),
     remove_possible_lock(Node),
-    restart_slave_if_needed(Node),
-    {noreply, State};
+    NoBlackList = sets:is_element(Node, State#state.normal_stop_slaves),
+    restart_slave_if_needed(Node, NoBlackList),
+    {noreply, 
+     State#state{normal_stop_slaves=
+                 sets:del_element(Node, State#state.normal_stop_slaves)}};
 
 handle_info(_Info, State) ->
     {noreply, State}.
@@ -247,17 +255,18 @@ remove_slaves(ClusterName, Server, NoOfSlaves) ->
                   end
             end,
             update_cluster(Cluster, [S#slave{state=?remove}||S<-SL, 
-                                     begin stop_slave(S#slave.name), true end])
+                                     begin stop_slave(S#slave.name, normal), 
+                                           true end])
     end.
 
-stop_slave(SlaveName) ->
-    send2slave(SlaveName, {stop, ?MASTER}).
+stop_slave(SlaveName, Reason) ->
+    send2slave(SlaveName, {stop, Reason, ?MASTER}).
 
 send2slave(SlaveName, Msg) ->
     {_, ProcessName, _, _} = split_slavename(SlaveName),
     gen_server:cast({ProcessName, SlaveName}, Msg).
 
-restart_slave_if_needed(Node) ->
+restart_slave_if_needed(Node, NoBlackList) ->
     {ClusterName, _, _No, Server} = split_slavename(Node),
     NoRestart =
     case get_cluster(ClusterName) of
@@ -273,7 +282,7 @@ restart_slave_if_needed(Node) ->
                 %% FIXME: check reduce task queue if this is last running reduce
                 [S] -> 
                     JobName = S#slave.jobname,
-                    update_job_blacklist(Node, JobName),
+                    NoBlackList orelse update_job_blacklist(Node, JobName),
                     Job = yamr_job:get_job(JobName),
                     if S#slave.state == ?map ->
                          rollback_map_task(Node, Job);
@@ -429,9 +438,15 @@ find_a_task4slave(JobName, SlaveName) ->
         [] -> 
             case get_reduce_tasks(JobName) of
                 [] ->
-                    %% FIXME
-                    set_slave_state(SlaveName, ?idle),
-                    gen_server:cast(?MASTER, {slave_idle, SlaveName}),
+                    %% tell slave to dump map data
+                    {_, ProcessName, _, _} = split_slavename(SlaveName),
+                    try ack = 
+                        gen_server:call({ProcessName, SlaveName}, 
+                                        {dump_remain_map_data, 
+                                         yamr_job:get_job(JobName)}),
+                        set_slave_state(SlaveName, ?idle),
+                        gen_server:cast(?MASTER, {slave_idle, SlaveName})
+                    catch _:_ -> stop_slave(SlaveName, force) end,
                     ok;
                 _ ->
                     take_one_reduce_task(JobName, SlaveName),
@@ -475,17 +490,7 @@ remove_map_tasks(JobName) ->
 map_done(JobName) ->
     ClusterName = yamr_job:get_clustername(JobName),
     Cluster = get_cluster(ClusterName),
-    lists:foreach(
-        fun(S) when S#slave.jobname =:= JobName ->
-                SlaveName = S#slave.name,
-                {_, ProcessName, _, _} = split_slavename(SlaveName),
-                try ack = 
-                    gen_server:call({ProcessName, SlaveName}, 
-                                    {prepare_reduce, yamr_job:get_job(JobName)})
-                catch _:_ -> stop_slave(SlaveName) end;
-           (_) -> ignore end, Cluster#cluster.slaves),
     ?LOG("final reduce phase for ~p", [JobName]),
-
     Job = yamr_job:get_job(JobName),
     yamr_job:put_job(Job#job{phase=reduce}),
     lists:foreach(
