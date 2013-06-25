@@ -8,7 +8,9 @@
          terminate/2, code_change/3]).
 
 -export([split_slavename/1]).
--record(state, {normal_stop_slaves=sets:new()}).
+-record(state, {switch_phase_slaves=[]::[{node(), string()}],
+                normal_stop_slaves=sets:new()}).
+
 -include("yamr.hrl").
 
 -define(CLUSTER_TAB, yamr_cluster_tab).
@@ -20,7 +22,8 @@
 
 -spec start_link() -> {ok, pid()} | ignore | {error, term()}.
 start_link() ->
-    gen_server:start_link({local, ?MASTER}, ?MODULE, [], []).
+    gen_server:start_link({local, ?MASTER}, ?MODULE, [], 
+                          [{spawn_opt, [{fullsweep_after, 100}]}]).
 
 %%%---------------------------------------------------------------------------
 %%% gen_server callbacks
@@ -63,8 +66,23 @@ handle_call({slave_up, Node}, _From, State) ->
     ?LOG("slave ~p up", [Node]),
     monitor_node(Node, true),
     add_slave(Node),
-    find_a_task4slave(Node),
-    {reply, ok, State};
+    NewState =
+    case lists:keyfind(Node, 1, State#state.switch_phase_slaves) of
+        false ->
+            find_a_task4slave(Node),
+            State;
+        {Node, JobName} ->
+            %%continue to take reduce tasks
+            case get_reduce_tasks(JobName) of
+                [] ->
+                    gen_server:cast(?MASTER, {slave_idle, Node});
+                _ ->
+                    take_one_reduce_task(JobName, Node)
+            end,
+            State#state{switch_phase_slaves=
+                    lists:keydelete(Node, 1, State#state.switch_phase_slaves)}
+    end,
+    {reply, ok, NewState};
        
 %% heartbeat from slaves
 handle_call({{heart_beat, ClusterName}, Node}, _From, State) ->
@@ -107,13 +125,22 @@ handle_cast({normal_stop, Node}, State) ->
      State#state{normal_stop_slaves=
                  sets:add_element(Node, State#state.normal_stop_slaves)}};
 
+handle_cast({{switch_phase, JobName}, Node}, State) ->
+    {noreply, 
+     State#state{switch_phase_slaves=
+                 lists:keystore(Node, 1, State#state.switch_phase_slaves, 
+                                {Node, JobName})}};
+
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({nodedown, Node}, State) ->
     ?LOG("slave down:~p", [Node]),
     remove_possible_lock(Node),
-    NoBlackList = sets:is_element(Node, State#state.normal_stop_slaves),
+    NoBlackList = 
+    sets:is_element(Node, State#state.normal_stop_slaves) orelse
+    begin case lists:keyfind(Node, 1, State#state.switch_phase_slaves) of
+                false -> false; _ -> true end end,
     restart_slave_if_needed(Node, NoBlackList),
     {noreply, 
      State#state{normal_stop_slaves=
@@ -156,39 +183,37 @@ start_slaves(_, _, 0, _, Reply) ->
     Reply;
 start_slaves(ClusterName, ServerName, NoOfSlaves, Args, Reply) ->
     NewReply =
-    case start_one_slave(ClusterName, ServerName, NoOfSlaves, Args) of
-        {ok, Node} ->
-            lists:append([Reply, " ", atom_to_list(Node), ":ok"]);
-        {error, Node, Reason} ->
-            lists:append([Reply, " ", atom_to_list(Node), ":", 
-                          atom_to_list(Reason)]);
+    case get_a_slavename(ClusterName, ServerName, NoOfSlaves) of
+        {ok, Slave} ->
+            case start_one_slave(ServerName, Slave, Args) of
+                {ok, Node} ->
+                    lists:append([Reply, " ", atom_to_list(Node), ":ok"]);
+                {error, Node, Reason} ->
+                    lists:append([Reply, " ", atom_to_list(Node), ":", 
+                                  atom_to_list(Reason)])
+            end;
         {error, Reason} ->
             lists:append([Reply, " None:", atom_to_list(Reason)])
     end,
     start_slaves(ClusterName, ServerName, NoOfSlaves-1, Args, NewReply).
 
-start_one_slave(ClusterName, Server) ->
+start_one_slave(Slave) ->
+    [SlaveName, Server] = string:tokens(atom_to_list(Slave), "@"),
     Args = erl_sys_args(),
-    start_one_slave(ClusterName, Server, 1, Args).
+    start_one_slave(Server, list_to_atom(SlaveName), Args).
 
-start_one_slave(ClusterName, Server, No, Args) ->
-    case get_a_slavename(ClusterName, Server, No) of
-        {ok, Slave} ->
-            ?LOG("start slave ~p on ~s with command ~p", 
-                 [Slave, Server, Args]),
-            Fun = fun(0, _F, R) ->
-                         ?LOG("failed to start slave:~p", [R]),
-                         {error, Slave, failed_to_start_slave};
-                     (Retry, F, _) ->
-                         case slave:start(Server, Slave, Args) of
-                             {ok, Node} -> {ok, Node};
-                             Reason -> F(Retry-1, F, Reason)
-                         end
-                  end,
-            Fun(?SLAVE_RETRIES, Fun, ok);
-        Error ->
-            Error
-    end.
+start_one_slave(Server, Slave, Args) ->
+    ?LOG("start slave ~p on ~s with command ~p", [Slave, Server, Args]),
+    Fun = fun(0, _F, R) ->
+               ?LOG("failed to start slave:~p", [R]),
+               {error, Slave, failed_to_start_slave};
+             (Retry, F, _) ->
+               case slave:start(Server, Slave, Args) of
+                   {ok, Node} -> {ok, Node};
+                   Reason -> F(Retry-1, F, Reason)
+               end
+          end,
+    Fun(?SLAVE_RETRIES, Fun, ok).
 
 get_a_slavename(ClusterName, Server, No) ->
     case get_cluster(ClusterName) of
@@ -255,7 +280,7 @@ remove_slaves(ClusterName, Server, NoOfSlaves) ->
                   end
             end,
             update_cluster(Cluster, [S#slave{state=?remove}||S<-SL, 
-                                     begin stop_slave(S#slave.name, normal), 
+                                     begin stop_slave(S#slave.name, remove), 
                                            true end])
     end.
 
@@ -267,14 +292,13 @@ send2slave(SlaveName, Msg) ->
     gen_server:cast({ProcessName, SlaveName}, Msg).
 
 restart_slave_if_needed(Node, NoBlackList) ->
-    {ClusterName, _, _No, Server} = split_slavename(Node),
     NoRestart =
-    case get_cluster(ClusterName) of
+    case get_cluster(Node) of
         not_found ->
             true;
         Cluster ->
             NewSlaves = [S||S<-Cluster#cluster.slaves, S#slave.name =/= Node],
-            update_cluster(Cluster#cluster{slaves=NewSlaves}),
+            update_cluster(Cluster#cluster{slaves = NewSlaves}),
             case Cluster#cluster.slaves -- NewSlaves of
                 [] -> true;
                 [S] when S#slave.state == ?idle -> false;
@@ -288,20 +312,22 @@ restart_slave_if_needed(Node, NoBlackList) ->
                          rollback_map_task(Node, Job);
                        true ->
                          rollback_reduce_task(Node, Job)
-                     end,
+                    end,
                     false
             end
     end,
-    NoRestart orelse spawn(fun() -> start_one_slave(ClusterName, Server) end).
+    NoRestart orelse spawn(fun() -> start_one_slave(Node) end).
 
 -spec erl_sys_args() -> string().
 erl_sys_args() ->
   {ok,[[LogPath]]} = init:get_argument(logs),
   {ok,[[ErlPath]]} = init:get_argument(pa),
+  {ok,[[Storage]]} = init:get_argument(nfs_storage),
   lists:append(["-rsh ssh -noshell -setcookie ",
                 atom_to_list(erlang:get_cookie()), " -connect_all false",
                 " -s yamr_slave start -logs ", LogPath, " -pa ", ErlPath,
-                " -yamrmaster ", atom_to_list(node())]).
+                " -yamrmaster ", atom_to_list(node()), " -nfs_storage ",
+                Storage]).
 
 get_cluster(SlaveName) when is_atom(SlaveName)->
     {ClusterName, _, _, _} = split_slavename(SlaveName),
@@ -327,7 +353,7 @@ update_cluster(Cluster, Slave) when is_record(Slave, slave) ->
                        true -> S end, true end],
     Cluster#cluster{slaves=Slaves}.
 
-%% yamr_slave-No-ClusterName@Server
+%% yamr_slave_No_ClusterName@Server
 get_slavename(ClusterName, SlaveNo) when is_integer(SlaveNo) ->
     list_to_atom(lists:append([atom_to_list(?SLAVE), "_", 
                                integer_to_list(SlaveNo), "_", ClusterName])).
@@ -353,14 +379,15 @@ handle_job(JobInfo, Cluster, From) ->
     end.
 
 map_task2slave(Task, SlaveName) ->
+    JobName = Task#map_task.jobname,
     MapMsg = {map, yamr_job:get_job(Task#map_task.jobname), Task},
     RunningTask = #running_map_task{slave=SlaveName, task=Task},
     NewTasks =
-    case ets:lookup(?MAP_TAB, Task#map_task.jobname) of
+    case ets:lookup(?MAP_TAB, JobName) of
         [] -> [RunningTask];
         [{_, Tasks}] -> [RunningTask|Tasks] end,
-    true = ets:insert(?MAP_TAB, {Task#map_task.jobname, NewTasks}),
-    set_slave_state(SlaveName, ?map),
+    true = ets:insert(?MAP_TAB, {JobName, NewTasks}),
+    set_slave_state(SlaveName, JobName, ?map),
     send2slave(SlaveName, MapMsg).
 
 get_slaves_by_state(Cluster, State) ->
@@ -410,7 +437,7 @@ continue_reduce_tasks(Idx, JobName, SlaveName) ->
                   remove_reduce_tasks(JobName),
                   remove_map_tasks(JobName),
                   remove_from_blacklist(SlaveName, JobName),
-                  reply_client(Job#job.client, "DONE:"++ResultFile);
+                  reply_client(Job#job.client, "Results: "++ResultFile++"\n");
                true -> ok
             end;
         _ ->
@@ -503,9 +530,7 @@ reply_client(Client, Reply) ->
     gen_server:reply(Client, Reply).
 
 set_slave_state(SlaveName, State) ->
-    Cluster = get_cluster(SlaveName),
-    update_cluster(Cluster, [S#slave{state=State}||S<-Cluster#cluster.slaves, 
-                             S#slave.name =:= SlaveName]).
+    set_slave_state(SlaveName, undefined, State).
 
 set_slave_state(SlaveName, JobName, State) ->
     Cluster = get_cluster(SlaveName),
@@ -535,7 +560,7 @@ rollback_reduce_task(Node, Job) ->
     store_reduce_tasks(NewTasks, Job#job.name).
 
 remove_possible_lock(Node) ->
-    yamr_file:remove_possible_lock(atom_to_list(Node)).
+    yamr_file:remove_possible_lock(atom_to_list(Node), get_jobname(Node)).
 
 update_job_blacklist(Node, JName) ->
     Cluster = get_cluster(Node),
@@ -564,6 +589,13 @@ get_job_blacklist(Node) ->
     case [S||S<-Cluster#cluster.servers, S#server.name == Server] of
         [] -> [];
         [Svr] -> [JobName||{JobName, Cnt}<-Svr#server.job_blacklist, Cnt > 3]
+    end.
+
+get_jobname(Node) ->
+    Cluster = get_cluster(Node),
+    case [S||S<-Cluster#cluster.slaves, S#slave.name == Node] of
+        [] -> [];
+        [Slave] -> Slave#slave.jobname
     end.
 
 remove_from_blacklist(Node, JobName) ->

@@ -7,14 +7,16 @@
          read/2,
          result/3,
          get_result/1,
-         remove_possible_lock/1,
+         remove_possible_lock/2,
          remove_map_files/2,
          remove_reduce_files/3]).
 
 -include("yamr.hrl").
 
--define(TMP, "/home/eboosun/tmp/yamr/").
 -define(INTERM, yamr_intermediate_tab_info).
+-define(STORAGE, begin 
+                   {ok,[[Storage]]} = init:get_argument(nfs_storage), Storage
+                 end).
 
 init(Job) ->
     case ets:info(?INTERM) of
@@ -31,6 +33,7 @@ init(Job) ->
                   true = ets:insert(Tab, {index, Idx}), 
                   true = ets:insert(Tab, {size, 0}), 
                   true end],
+    ok = filelib:ensure_dir(filename:join([?STORAGE, Job#job.name, "x"])),
     true = ets:insert(?INTERM, {maxsize, TabSize}),
     true = ets:insert(?INTERM, {tabs, Tabs}).
 
@@ -70,8 +73,9 @@ write(Job, Idx, KVs) ->
     MxSiz > NewSiz orelse write2file(Job, Tab).
 
 remove_map_files(Node, Job) ->
-    WC = lists:append([?TMP, Job#job.clustername, "_", Job#job.name, "_*_",
-                       atom_to_list(Node), ".tmp"]),
+    WC = filename:join([?STORAGE, Job#job.name, 
+                       lists:append([Job#job.clustername, "_*_", 
+                                     atom_to_list(Node), ".tmp"])]),
     lists:foreach(fun(F) -> ?LOG("remove map file ~p", [F]), file:delete(F) end,
                   filelib:wildcard(WC)).
 
@@ -88,7 +92,7 @@ result(Job, Idx, KVs) ->
     file:write_file(FileName, term_to_binary(KVs)).
 
 get_result(Job) ->
-    lists:append([?TMP, Job#job.clustername, "_", Job#job.name, "_*.result"]).
+    filename:join([?STORAGE, Job#job.name]).
 
 write2file(Job, Tab) ->
     case ets:info(Tab) of
@@ -129,8 +133,9 @@ get_filename(Job, Idx) ->
     lists:append([get_prefix(Job, Idx), atom_to_list(node()), ".tmp"]).
 
 get_prefix(Job, Idx) ->
-    lists:append([?TMP, Job#job.clustername, "_", Job#job.name, "_",
-                  integer_to_list(Idx), "_"]).
+    filename:join([?STORAGE, Job#job.name, 
+                  lists:append([Job#job.clustername, "_",
+                                integer_to_list(Idx), "_"])]).
 
 get_files(Job, Idx) ->
     filelib:wildcard(get_prefix(Job, Idx)++"*.tmp").
@@ -162,7 +167,7 @@ get_max_tab_size(Job) ->
        true -> Size
     end.
 
-remove_possible_lock(Owner) ->
+remove_possible_lock(Owner, JobName) ->
     lists:foreach(
         fun(F) -> 
            case file:read_file(F) of
@@ -174,4 +179,4 @@ remove_possible_lock(Owner) ->
                        _ -> ok
                    end;
                _ -> ok end
-        end, filelib:wildcard(?TMP++"*.lock")).
+        end, filelib:wildcard(filename:join([?STORAGE, JobName, "*.lock"]))).

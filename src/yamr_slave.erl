@@ -24,7 +24,8 @@ start() ->
     {ClusterName, SlaveName, _N, _Server} = split_slavename(node()),
     ?LOG("slave process Name ~p", [SlaveName]),
     {ok, Pid} = gen_server:start_link({local, SlaveName}, ?MODULE, 
-                                [#state{clustername=ClusterName}], []),
+                                      [#state{clustername=ClusterName}],
+                                      [{spawn_opt, [{fullsweep_after, 100}]}]),
     erlang:monitor(process, Pid),
     monitor(Pid).
 
@@ -77,6 +78,8 @@ handle_call(_Msg, _From, State) ->
 handle_cast({stop, Reason, ?MASTER}, State) ->
     ?LOG("stop slave reason:~p", [Reason]),
     if Reason =:= normal ->
+        cast_master({switch_phase,State#state.jobname},State#state.mastername);
+       Reason =:= remove ->
         cast_master(normal_stop, State#state.mastername);
        true -> ok end,
     halt();
