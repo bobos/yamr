@@ -25,7 +25,7 @@ start() ->
     ?LOG("slave process Name ~p", [SlaveName]),
     {ok, Pid} = gen_server:start_link({local, SlaveName}, ?MODULE, 
                                       [#state{clustername=ClusterName}],
-                                      [{spawn_opt, [{fullsweep_after, 100}]}]),
+                                      [{spawn_opt, [{fullsweep_after, 1000}]}]),
     erlang:monitor(process, Pid),
     monitor(Pid).
 
@@ -78,8 +78,6 @@ handle_call(_Msg, _From, State) ->
 handle_cast({stop, Reason, ?MASTER}, State) ->
     ?LOG("stop slave reason:~p", [Reason]),
     if Reason =:= normal ->
-        cast_master({switch_phase,State#state.jobname},State#state.mastername);
-       Reason =:= remove ->
         cast_master(normal_stop, State#state.mastername);
        true -> ok end,
     halt();
@@ -161,22 +159,19 @@ handle_map_task(Job, Task, State) when Job#job.language =:= "Erlang" ->
     NewState#state{state = ?map, map_worker = start_a_worker(Fun)}.
 
 handle_reduce_task(Job, Task, State) when Job#job.language =:= "Erlang" ->
+    JobName = Job#job.name,
     case {State#state.jobname, State#state.state} of
-        {_, ?map} ->
-            dump_remain_map_data(Job),
-            State;
-        {JobName, SlaveStat}->
-            NewState =
-            if JobName == Job#job.name andalso SlaveStat == ?reduce ->
-                State;
-               true ->
-                prepare_env(Job, ?reduce),
-                State#state{jobname = Job#job.name, state = ?reduce}
-            end,
+        {JobName, SlaveStat} ->
+            if SlaveStat == ?map -> dump_remain_map_data(Job);
+               SlaveStat == ?idle -> prepare_env(Job, ?reduce);
+               true -> ok end,
+            NewState = State#state{state = ?reduce},
             Parent = self(),
             Fun = fun() -> reduce(Job, Task, Parent, 
-                           Job#job.phase == reduce) end,
-            NewState#state{reduce_worker = start_a_worker(Fun)}
+                                  Job#job.phase == reduce) end,
+            NewState#state{reduce_worker = start_a_worker(Fun)};
+        _ ->
+            State
     end.
 
 dump_remain_map_data(Job) ->
@@ -188,9 +183,7 @@ dump_remain_map_data(Job) ->
     after 60000 -> 
         ?LOG("dump timeout for ~p", [Job#job.name]), 
         halt() 
-    end,
-    %% restart slave to cleanup everything left during map operation
-    gen_server:cast(self(), {stop, normal, ?MASTER}).
+    end.
 
 map(Job, Task, Pid) ->
     CBModule = list_to_atom(Job#job.cb_module),

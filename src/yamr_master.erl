@@ -8,8 +8,7 @@
          terminate/2, code_change/3]).
 
 -export([split_slavename/1]).
--record(state, {switch_phase_slaves=[]::[{node(), string()}],
-                normal_stop_slaves=sets:new()}).
+-record(state, {normal_stop_slaves=sets:new()}).
 
 -include("yamr.hrl").
 
@@ -23,7 +22,7 @@
 -spec start_link() -> {ok, pid()} | ignore | {error, term()}.
 start_link() ->
     gen_server:start_link({local, ?MASTER}, ?MODULE, [], 
-                          [{spawn_opt, [{fullsweep_after, 100}]}]).
+                          [{spawn_opt, [{fullsweep_after, 1000}]}]).
 
 %%%---------------------------------------------------------------------------
 %%% gen_server callbacks
@@ -66,23 +65,8 @@ handle_call({slave_up, Node}, _From, State) ->
     ?LOG("slave ~p up", [Node]),
     monitor_node(Node, true),
     add_slave(Node),
-    NewState =
-    case lists:keyfind(Node, 1, State#state.switch_phase_slaves) of
-        false ->
-            find_a_task4slave(Node),
-            State;
-        {Node, JobName} ->
-            %%continue to take reduce tasks
-            case get_reduce_tasks(JobName) of
-                [] ->
-                    gen_server:cast(?MASTER, {slave_idle, Node});
-                _ ->
-                    take_one_reduce_task(JobName, Node)
-            end,
-            State#state{switch_phase_slaves=
-                    lists:keydelete(Node, 1, State#state.switch_phase_slaves)}
-    end,
-    {reply, ok, NewState};
+    find_a_task4slave(Node),
+    {reply, ok, State};
        
 %% heartbeat from slaves
 handle_call({{heart_beat, ClusterName}, Node}, _From, State) ->
@@ -125,22 +109,13 @@ handle_cast({normal_stop, Node}, State) ->
      State#state{normal_stop_slaves=
                  sets:add_element(Node, State#state.normal_stop_slaves)}};
 
-handle_cast({{switch_phase, JobName}, Node}, State) ->
-    {noreply, 
-     State#state{switch_phase_slaves=
-                 lists:keystore(Node, 1, State#state.switch_phase_slaves, 
-                                {Node, JobName})}};
-
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({nodedown, Node}, State) ->
     ?LOG("slave down:~p", [Node]),
     remove_possible_lock(Node),
-    NoBlackList = 
-    sets:is_element(Node, State#state.normal_stop_slaves) orelse
-    begin case lists:keyfind(Node, 1, State#state.switch_phase_slaves) of
-                false -> false; _ -> true end end,
+    NoBlackList = sets:is_element(Node, State#state.normal_stop_slaves),
     restart_slave_if_needed(Node, NoBlackList),
     {noreply, 
      State#state{normal_stop_slaves=
@@ -280,7 +255,7 @@ remove_slaves(ClusterName, Server, NoOfSlaves) ->
                   end
             end,
             update_cluster(Cluster, [S#slave{state=?remove}||S<-SL, 
-                                     begin stop_slave(S#slave.name, remove), 
+                                     begin stop_slave(S#slave.name, normal), 
                                            true end])
     end.
 
@@ -427,7 +402,7 @@ continue_reduce_tasks(Idx, JobName, SlaveName) ->
     case ReduceTasks#reduce_tasks.queue_tasks of
         [] ->
             set_slave_state(SlaveName, ?idle),
-            gen_server:cast(?MASTER, {slave_idle, SlaveName}),
+            stop_slave(SlaveName, normal),
             if RestRuns =:= [] ->
                   %% map reduce is done
                   %% FIXME
@@ -472,7 +447,7 @@ find_a_task4slave(JobName, SlaveName) ->
                                         {dump_remain_map_data, 
                                          yamr_job:get_job(JobName)}),
                         set_slave_state(SlaveName, ?idle),
-                        gen_server:cast(?MASTER, {slave_idle, SlaveName})
+                        stop_slave(SlaveName, normal)
                     catch _:_ -> stop_slave(SlaveName, force) end,
                     ok;
                 _ ->
@@ -500,7 +475,7 @@ take_one_reduce_task(JobName, SlaveName) ->
             store_reduce_tasks(NewReduce, JobName);
         false -> 
             set_slave_state(SlaveName, ?idle),
-            gen_server:cast(?MASTER, {slave_idle, SlaveName})
+            stop_slave(SlaveName, normal)
     end.
 
 remove_map_task(JobName, Node) ->
@@ -517,7 +492,7 @@ remove_map_tasks(JobName) ->
 map_done(JobName) ->
     ClusterName = yamr_job:get_clustername(JobName),
     Cluster = get_cluster(ClusterName),
-    ?LOG("final reduce phase for ~p", [JobName]),
+    ?LOG("all map operations are done for ~p", [JobName]),
     Job = yamr_job:get_job(JobName),
     yamr_job:put_job(Job#job{phase=reduce}),
     lists:foreach(
