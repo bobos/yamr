@@ -187,8 +187,7 @@ dump_remain_map_data(Job) ->
 
 map(Job, Task, Pid) ->
     CBModule = list_to_atom(Job#job.cb_module),
-    {Key, ValueBin} = Task#map_task.task,
-    KVs = CBModule:map(Key, binary_to_list(ValueBin)),
+    KVs = CBModule:map(Task#map_task.task),
     Ret = pre_reduce(CBModule, aggre_values(KVs, lists, false), 
                      Task#map_task.partition, []),
     Idxs = [Idx||{Idx, KVs1}<-Ret, 
@@ -218,11 +217,6 @@ loop(Job, Idx, CB, Pid, Fun) ->
 
 retreive_map_data(Job, Idx) ->
     KVs = yamr_file:read(Job, Idx),
-    %lists:foldl(
-    %    fun({K, V}, Acc) ->
-    %        NewV = CB:reduce(K, V),
-    %        [{K, NewV}|Acc]
-    %    end, [], aggre_values(yamr_file:read(Job, Idx), lists)),
     write_db(KVs).
 
 prepare_env(Job, Phase) ->

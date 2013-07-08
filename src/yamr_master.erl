@@ -440,21 +440,14 @@ find_a_task4slave(JobName, SlaveName) ->
         [] -> 
             case get_reduce_tasks(JobName) of
                 [] ->
-                    %% tell slave to dump map data
-                    {_, ProcessName, _, _} = split_slavename(SlaveName),
-                    try ack = 
-                        gen_server:call({ProcessName, SlaveName}, 
-                                        {dump_remain_map_data, 
-                                         yamr_job:get_job(JobName)}),
-                        set_slave_state(SlaveName, ?idle),
-                        stop_slave(SlaveName, normal)
-                    catch _:_ -> stop_slave(SlaveName, force) end,
-                    ok;
+                    %% not possible to get here, stop whole server
+                    ?LOG("Error! Not possible to get here, exit!"),
+                    halt();
                 _ ->
-                    take_one_reduce_task(JobName, SlaveName),
-                    [{_, Maps}] = ets:lookup(?MAP_TAB, JobName),
-                    if Maps == [] -> map_done; true -> ok end
-            end;
+                    take_one_reduce_task(JobName, SlaveName)
+            end,
+            [{_, Maps}] = ets:lookup(?MAP_TAB, JobName),
+            if Maps == [] -> map_done; true -> ok end;
         Task ->
             map_task2slave(Task, SlaveName),
             ok
@@ -474,8 +467,15 @@ take_one_reduce_task(JobName, SlaveName) ->
                              queue_tasks=Rest},
             store_reduce_tasks(NewReduce, JobName);
         false -> 
-            set_slave_state(SlaveName, ?idle),
-            stop_slave(SlaveName, normal)
+            %% tell slave to dump map data
+            try {_, ProcessName, _, _} = split_slavename(SlaveName),
+                ack = gen_server:call({ProcessName, SlaveName}, 
+                                      {dump_remain_map_data, 
+                                      yamr_job:get_job(JobName)}),
+                set_slave_state(SlaveName, ?idle),
+                stop_slave(SlaveName, normal)
+            catch _:_ -> stop_slave(SlaveName, force)
+            end
     end.
 
 remove_map_task(JobName, Node) ->

@@ -33,7 +33,10 @@ init(Job) ->
                   true = ets:insert(Tab, {index, Idx}), 
                   true = ets:insert(Tab, {size, 0}), 
                   true end],
-    ok = filelib:ensure_dir(filename:join([?STORAGE, Job#job.name, "x"])),
+    Dir = filename:join([?STORAGE, Job#job.name]),
+    ok = filelib:ensure_dir(filename:join([Dir, "doesn'tMatter"])),
+    %% cleanup everything
+    os:cmd("rm -f "++Dir++"/*.result"),
     true = ets:insert(?INTERM, {maxsize, TabSize}),
     true = ets:insert(?INTERM, {tabs, Tabs}).
 

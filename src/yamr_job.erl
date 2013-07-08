@@ -101,18 +101,17 @@ get_tasks_from_file(Job, NoOfTasks) ->
               {[], Job#job{progress_index = -1}};
            true ->
               {ok, Bin} = file:read_file(Job#job.jobfile),
-              {ok, {obj, JsonData}, []} = rfc4627:decode(Bin),
-              Job#job.number_of_tasks =/= -1 orelse validate_cont(JsonData),
+              Data = string:tokens(binary_to_list(Bin), "\n"),
               Index = Job#job.progress_index,
-              {_, Left} = lists:split(Index, JsonData),
+              {_, Left} = lists:split(Index, Data),
               {Tasks1, NewIndex} =
               if NoOfTasks >= length(Left) ->
                     {Left, -1};
                  true ->
-                    {KVs, _} = lists:split(NoOfTasks, Left),
-                    {KVs, Index+NoOfTasks}
+                    {Tks, _} = lists:split(NoOfTasks, Left),
+                    {Tks, Index+NoOfTasks}
               end,
-              {Tasks1, Job#job{number_of_tasks=length(JsonData), 
+              {Tasks1, Job#job{number_of_tasks=length(Data), 
                                progress_index=NewIndex}}
         end,
         ?MASTER ! {ok,
@@ -120,7 +119,7 @@ get_tasks_from_file(Job, NoOfTasks) ->
                               clustername=Job#job.clustername, 
                               priority=Job#job.priority, 
                               partition=Job#job.partition,
-                              task=KV}||KV<-Tasks], NewJob}
+                              task=T}||T<-Tasks], NewJob}
     catch _:_ -> ?MASTER ! {error, ?ERR_RET} end.
 
 get_yasks() ->
@@ -201,6 +200,3 @@ split_yasks_by_prio(Yasks, Prio) ->
 get_a_jobname(ClusterName, JobId) ->
     ClusterName++"-"++integer_to_list(JobId).
 
-validate_cont([{Key, Val}]) when is_list(Key), is_binary(Val) -> ok;
-validate_cont([{Key, Val}|Rest]) when is_list(Key), is_binary(Val) ->
-    validate_cont(Rest).
